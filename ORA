@@ -1,0 +1,190 @@
+# GENERAL CLUSTER-WISE OVER-REPRESENTATION ANALYSIS (ORA)
+# GO BP / MF / CC, Reactome and KEGG; Excel tables and bubble plots.
+#
+# Install once if needed:
+# install.packages(c("ggplot2", "openxlsx", "BiocManager"))
+# BiocManager::install(c("clusterProfiler", "ReactomePA", "AnnotationDbi",
+#                       "org.Hs.eg.db"))
+#
+# INPUTS:
+# 1. A wide TSV: each column is one cluster's selected gene symbols.
+#    Columns may have different list lengths padded with blank cells or NA.
+# 2. A TSV with a Gene column containing ALL genes eligible for selection
+#    in this experiment (the tested/detected background, not just selected genes).
+# Alternatively supply an existing wide_cluster data.frame in section 2.
+
+# 1. SETTINGS -----------------------------------------------------------------
+cluster_file <- "input/cluster_gene_lists.tsv"
+background_file <- "input/background_genes.tsv"
+background_gene_col <- "Gene"
+output_dir <- "cluster_ORA_results"
+
+# These three organism settings must agree. Defaults below are for human.
+orgdb_package <- "org.Hs.eg.db"
+reactome_organism <- "human"
+kegg_organism <- "hsa"
+# Example mouse settings: org.Mm.eg.db / mouse / mmu
+
+pvalue_cutoff <- 0.10   # Applied to both raw and BH-adjusted p-values.
+qvalue_cutoff <- 0.20
+min_set_size <- 10L
+max_set_size <- 500L
+top_n <- 10L
+# BH adjustment is performed separately for each cluster/database analysis.
+# The cutoffs above preserve the supplied code; change as required.
+
+required <- c("clusterProfiler", "ReactomePA", "AnnotationDbi", "ggplot2",
+              "openxlsx", orgdb_package)
+missing <- required[!vapply(required, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing)) stop("Install required packages: ", paste(missing, collapse = ", "))
+org_db <- getExportedValue(orgdb_package, orgdb_package)
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+# 2. READ AND CLEAN GENE LISTS -------------------------------------------------
+clean_genes <- function(x) {
+  x <- trimws(as.character(x))
+  unique(x[!is.na(x) & nzchar(x)])
+}
+wide_cluster <- utils::read.delim(cluster_file, check.names = FALSE,
+                                stringsAsFactors = FALSE, colClasses = "character")
+# To use a data.frame already in R, replace the line above with:
+# wide_cluster <- your_cluster_table
+if (!ncol(wide_cluster)) stop("The cluster table has no columns.")
+if (anyDuplicated(names(wide_cluster)) || any(!nzchar(names(wide_cluster)))) {
+  stop("Cluster columns must have unique, nonempty names.")
+}
+gene_lists <- lapply(wide_cluster, clean_genes)
+background_table <- utils::read.delim(background_file, check.names = FALSE,
+                                    stringsAsFactors = FALSE, colClasses = "character")
+if (!background_gene_col %in% names(background_table)) stop("Background gene column missing.")
+background_symbols <- clean_genes(background_table[[background_gene_col]])
+if (!length(background_symbols)) stop("The background gene list is empty.")
+outside <- setdiff(unique(unlist(gene_lists, use.names = FALSE)), background_symbols)
+if (length(outside)) {
+  stop(length(outside), " selected symbols are absent from the background. Correct the inputs.")
+}
+
+# 3. MAP SYMBOLS TO ENTREZ IDS -------------------------------------------------
+# Map foreground and background using the same annotation and mapping rule.
+# Retain all valid SYMBOL-to-ENTREZID pairs; deduplicate IDs before testing.
+valid_symbols <- intersect(background_symbols, AnnotationDbi::keys(org_db, keytype = "SYMBOL"))
+if (!length(valid_symbols)) stop("No symbols match the organism database; check identifiers.")
+mapping <- AnnotationDbi::select(org_db, keys = valid_symbols,
+                               keytype = "SYMBOL", columns = "ENTREZID")
+mapping <- unique(mapping[!is.na(mapping$ENTREZID), c("SYMBOL", "ENTREZID")])
+utils::write.csv(mapping, file.path(output_dir, "symbol_to_entrez_mapping.csv"), row.names = FALSE)
+unmapped <- setdiff(background_symbols, mapping$SYMBOL)
+utils::write.csv(data.frame(SYMBOL = unmapped),
+                 file.path(output_dir, "unmapped_background_symbols.csv"), row.names = FALSE)
+map_genes <- function(symbols) unique(as.character(mapping$ENTREZID[mapping$SYMBOL %in% symbols]))
+background_entrez <- map_genes(background_symbols)
+if (!length(background_entrez)) stop("No background genes map to Entrez IDs.")
+entrez_lists <- lapply(gene_lists, map_genes)
+qc <- data.frame(cluster = names(gene_lists),
+                 input_symbols = lengths(gene_lists),
+                 mapped_symbols = vapply(gene_lists, function(x) sum(x %in% mapping$SYMBOL), integer(1)),
+                 unique_entrez_ids = lengths(entrez_lists), row.names = NULL)
+utils::write.csv(qc, file.path(output_dir, "mapping_summary.csv"), row.names = FALSE)
+# Annotation coverage differs by database; each test uses its annotated subset
+# of the supplied universe. Review mapping_summary.csv before interpreting results.
+
+# 4. RUN ONE ENRICHMENT TEST ---------------------------------------------------
+run_ora <- function(genes, category) {
+  if (!length(genes)) return(NULL)
+  common <- list(gene = genes, universe = background_entrez,
+                 pvalueCutoff = pvalue_cutoff, qvalueCutoff = qvalue_cutoff,
+                 pAdjustMethod = "BH", minGSSize = min_set_size,
+                 maxGSSize = max_set_size)
+  if (startsWith(category, "GO_")) {
+    return(do.call(clusterProfiler::enrichGO,
+                   c(common, list(OrgDb = org_db, keyType = "ENTREZID",
+                                  ont = sub("GO_", "", category), readable = TRUE))))
+  }
+  if (category == "Reactome") {
+    return(do.call(ReactomePA::enrichPathway,
+                   c(common, list(organism = reactome_organism, readable = TRUE))))
+  }
+  # KEGG may require internet access. Errors stop the script so a failed query
+  # is not silently reported as an absence of enrichment.
+  result <- do.call(clusterProfiler::enrichKEGG,
+                    c(common, list(organism = kegg_organism, keyType = "ncbi-geneid")))
+  if (!is.null(result) && nrow(as.data.frame(result))) {
+    result <- clusterProfiler::setReadable(result, OrgDb = org_db, keyType = "ENTREZID")
+  }
+  result
+}
+
+# 5. REUSABLE BUBBLE PLOT ------------------------------------------------------
+save_bubble <- function(df, category, cluster, folder) {
+  if (!nrow(df)) return(invisible(NULL))
+  df <- df[is.finite(df$p.adjust) & is.finite(df$pvalue), , drop = FALSE]
+  df <- head(df[order(df$p.adjust, df$pvalue), , drop = FALSE], top_n)
+  if (!nrow(df)) return(invisible(NULL))
+  df$ratio <- vapply(strsplit(as.character(df$GeneRatio), "/", fixed = TRUE),
+                     function(x) as.numeric(x[1]) / as.numeric(x[2]), numeric(1))
+  labels <- vapply(as.character(df$Description),
+                    function(x) paste(strwrap(x, width = 40), collapse = "\n"), character(1))
+  names(labels) <- df$ID
+  df$term <- factor(df$ID, levels = rev(df$ID))
+  colors <- if (startsWith(category, "GO_")) c("#663838", "#CEA6A6") else c("#4B1656", "#DBA2E6")
+  p <- ggplot2::ggplot(df, ggplot2::aes(x = ratio, y = term, size = Count, color = p.adjust)) +
+    ggplot2::geom_point() +
+    ggplot2::scale_y_discrete(labels = labels) +
+    ggplot2::scale_color_gradient(low = colors[1], high = colors[2]) +
+    ggplot2::scale_size_continuous(range = c(3, 8)) +
+    ggplot2::labs(title = paste(category, "-", cluster), x = "Gene ratio", y = NULL,
+                  size = "Gene count", color = "Adjusted p-value") +
+    ggplot2::theme_minimal(base_size = 11) +
+    ggplot2::theme(plot.title = ggplot2::element_text(face = "bold"))
+  height <- max(4, 2 + 0.6 * nrow(df))
+  ggplot2::ggsave(file.path(folder, "bubble_plot.png"), p, width = 10, height = height, dpi = 300)
+  ggplot2::ggsave(file.path(folder, "bubble_plot.pdf"), p, width = 10, height = height)
+}
+
+# 6. ANALYZE ALL CLUSTERS AND EXPORT -------------------------------------------
+# Numeric sheet/folder IDs avoid invalid characters and duplicate/truncated names.
+# cluster_index.csv records the original cluster names.
+cluster_index <- data.frame(id = sprintf("Cluster_%03d", seq_along(gene_lists)),
+                            cluster = names(gene_lists))
+utils::write.csv(cluster_index, file.path(output_dir, "cluster_index.csv"), row.names = FALSE)
+all_results <- list()
+for (category in c("GO_BP", "GO_MF", "GO_CC", "Reactome", "KEGG")) {
+  category_results <- setNames(vector("list", length(gene_lists)), names(gene_lists))
+  sheets <- list()
+  for (i in seq_along(gene_lists)) {
+    cluster <- names(gene_lists)[i]
+    message("Running ", category, " / ", cluster)
+    result <- run_ora(entrez_lists[[i]], category)
+    # Single-bracket list assignment preserves empty clusters, including NULLs.
+    category_results[i] <- list(result)
+    df <- if (is.null(result)) data.frame() else as.data.frame(result)
+    if (nrow(df)) df <- df[order(df$p.adjust, df$pvalue), , drop = FALSE]
+    status <- if (!length(entrez_lists[[i]])) "No mapped genes" else "No terms pass cutoffs"
+    export <- if (nrow(df)) df else data.frame(Status = status)
+    folder <- file.path(output_dir, category, cluster_index$id[i])
+    dir.create(folder, recursive = TRUE, showWarnings = FALSE)
+    utils::write.csv(export, file.path(folder, "enrichment_results.csv"), row.names = FALSE)
+    sheets[[cluster_index$id[i]]] <- export
+    save_bubble(df, category, cluster, folder)
+  }
+  openxlsx::write.xlsx(c(list(Cluster_index = cluster_index), sheets),
+                       file.path(output_dir, paste0(category, "_by_cluster.xlsx")), overwrite = TRUE)
+  all_results[[category]] <- category_results
+}
+saveRDS(all_results, file.path(output_dir, "enrichment_objects.rds"))
+saveRDS(list(background_entrez = background_entrez, gene_lists_entrez = entrez_lists,
+             orgdb_package = orgdb_package, reactome_organism = reactome_organism,
+             kegg_organism = kegg_organism, pvalue_cutoff = pvalue_cutoff,
+             qvalue_cutoff = qvalue_cutoff, min_set_size = min_set_size,
+             max_set_size = max_set_size, top_n = top_n),
+        file.path(output_dir, "analysis_inputs_and_settings.rds"))
+# sessionInfo contains platform details; review generated files before sharing.
+writeLines(capture.output(utils::sessionInfo()), file.path(output_dir, "sessionInfo.txt"))
+message("Finished. Results saved to: ", output_dir)
+
+# INTERPRETATION:
+# ORA tests whether selected genes overlap a term more than expected relative
+# to the background. It does not infer activation/suppression or use gene ranks.
+# For directional questions, prepare separate up- and downregulated gene lists.
+# Excel/CSV tables contain terms passing the configured package cutoffs.
+# GeneRatio is Count divided by the database-specific annotated query size.
