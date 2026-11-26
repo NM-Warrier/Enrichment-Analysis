@@ -1,0 +1,179 @@
+# GENERAL PRERANKED GSEA PIPELINE
+# Input: ALL tested genes, not only significant differentially expressed genes.
+# Required columns (configurable below): gene symbol, signed effect, raw p-value.
+# Gene symbols must match the selected species; this script does not map IDs.
+# Positive effects must consistently represent the first group vs the reference.
+#
+# Install once if needed:
+# install.packages(c("ggplot2", "msigdbr", "openxlsx", "BiocManager"))
+# BiocManager::install("fgsea")
+
+# 1. EDIT SETTINGS -------------------------------------------------------------
+comparisons <- c(
+  Group_A_vs_Group_B = "input/comparison_1.tsv"
+  # , Group_C_vs_Group_B = "input/comparison_2.tsv"
+)
+output_dir <- "enrichment_results"
+gene_col <- "Gene"
+effect_col <- "log2FC"
+pvalue_col <- "pvalue"  # Raw, unadjusted p-values for the ranking formula.
+stat_col <- NULL        # Optional signed test statistic column, e.g. "t".
+species <- "Homo sapiens"  # Change to match the gene symbols in your input.
+min_size <- 10L
+max_size <- 500L
+fdr_cutoff <- 0.05
+top_n <- 10L
+seed <- 42L
+
+# 2. CHECK PACKAGES ------------------------------------------------------------
+required <- c("fgsea", "msigdbr", "ggplot2", "openxlsx")
+missing <- required[!vapply(required, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing)) stop("Install required packages: ", paste(missing, collapse = ", "))
+if (anyDuplicated(names(comparisons)) || any(!nzchar(names(comparisons)))) {
+  stop("Give each comparison a unique, nonempty name.")
+}
+if (any(!grepl("^[A-Za-z0-9_-]+$", names(comparisons)))) {
+  stop("Use only letters, numbers, underscores and hyphens in comparison names.")
+}
+
+# 3. PREPARE RANKED GENES ------------------------------------------------------
+prepare_ranks <- function(df) {
+  needed <- c(gene_col, if (is.null(stat_col)) c(effect_col, pvalue_col) else stat_col)
+  if (!all(needed %in% names(df))) {
+    stop("Missing columns: ", paste(setdiff(needed, names(df)), collapse = ", "))
+  }
+  to_numeric <- function(x) suppressWarnings(as.numeric(as.character(x)))
+  gene <- trimws(as.character(df[[gene_col]]))
+  if (is.null(stat_col)) {
+    effect <- to_numeric(df[[effect_col]])
+    p <- to_numeric(df[[pvalue_col]])
+    valid <- is.finite(effect) & is.finite(p) & p >= 0 & p <= 1
+    # Avoid infinite scores when reported p-values are zero.
+    score <- sign(effect) * -log10(pmax(p, .Machine$double.xmin))
+  } else {
+    score <- to_numeric(df[[stat_col]])
+    valid <- is.finite(score)
+  }
+  valid <- valid & !is.na(gene) & nzchar(gene) & is.finite(score)
+  x <- data.frame(gene = gene[valid], score = score[valid])
+  message("Removed ", nrow(df) - nrow(x), " invalid rows.")
+  # Deterministic duplicate rule: retain the largest absolute ranking score.
+  # Prefer resolving multiple probes/transcripts at gene level upstream.
+  x <- x[order(-abs(x$score), x$gene, -x$score), , drop = FALSE]
+  message("Collapsed ", sum(duplicated(x$gene)), " duplicate gene rows.")
+  x <- x[!duplicated(x$gene), , drop = FALSE]
+  x <- x[order(-x$score, x$gene), , drop = FALSE]
+  if (nrow(x) < min_size || !any(x$score != 0)) stop("Insufficient informative genes.")
+  if (anyDuplicated(x$score)) warning("Tied ranking scores detected; consider a signed test statistic.")
+  if (!any(x$score < 0) || !any(x$score > 0)) {
+    warning("Ranks do not contain both signs; check contrast direction and input filtering.")
+  }
+  stats::setNames(x$score, x$gene)
+}
+
+# 4. LOAD GENE SETS ONCE -------------------------------------------------------
+# Human MSigDB collections, mapped by msigdbr to the requested output species.
+collections <- list(
+  GO_BP = c("C5", "GO:BP"),
+  GO_CC = c("C5", "GO:CC"),
+  GO_MF = c("C5", "GO:MF"),
+  Reactome = c("C2", "CP:REACTOME")
+)
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+gene_sets <- lapply(collections, function(spec) {
+  d <- msigdbr::msigdbr(species = species, collection = spec[1], subcollection = spec[2])
+  d <- d[!is.na(d$gene_symbol) & nzchar(d$gene_symbol), ]
+  lapply(split(d$gene_symbol, d$gs_name), unique)
+})
+# Save exactly the gene sets used for reproducibility.
+saveRDS(gene_sets, file.path(output_dir, "gene_sets_used.rds"))
+
+# 5. REUSABLE BUBBLE PLOT ------------------------------------------------------
+save_bubble <- function(result, direction, collection, comparison, folder) {
+  keep <- is.finite(result$padj) & result$padj <= fdr_cutoff & is.finite(result$NES)
+  keep <- keep & if (direction == "Positive") result$NES > 0 else result$NES < 0
+  d <- result[keep, , drop = FALSE]
+  d <- head(d[order(d$padj, d$pval, -abs(d$NES)), , drop = FALSE], top_n)
+  if (!nrow(d)) {
+    message(collection, " / ", direction, ": no terms pass FDR threshold; plot skipped.")
+    return(invisible(NULL))
+  }
+  # Preserve original pathway IDs in tables; shorten labels only for plotting.
+  labels <- gsub("_", " ", sub("^(GOBP|GOCC|GOMF|REACTOME)_", "", d$pathway))
+  labels <- vapply(labels, function(x) paste(strwrap(x, width = 40), collapse = "\n"), character(1))
+  d$term <- factor(d$pathway, levels = rev(d$pathway))
+  names(labels) <- d$pathway
+  colors <- if (direction == "Positive") c("indianred4", "salmon") else c("orchid4", "plum")
+  p <- ggplot2::ggplot(d, ggplot2::aes(x = NES, y = term, size = size, color = padj)) +
+    ggplot2::geom_point() +
+    ggplot2::scale_y_discrete(labels = labels) +
+    ggplot2::scale_color_gradient(low = colors[1], high = colors[2]) +
+    ggplot2::scale_size_continuous(range = c(3, 8)) +
+    ggplot2::labs(title = paste(collection, "-", direction, "enrichment"),
+                  subtitle = comparison, x = "Normalized enrichment score (NES)",
+                  y = NULL, color = "Adjusted p-value", size = "Matched set size") +
+    ggplot2::theme_minimal(base_size = 11) +
+    ggplot2::theme(plot.title = ggplot2::element_text(face = "bold"),
+                   axis.text = ggplot2::element_text(color = "black"))
+  stem <- file.path(folder, paste0(collection, "_", direction, "_bubble"))
+  height <- max(4, 2 + 0.6 * nrow(d))
+  ggplot2::ggsave(paste0(stem, ".png"), p, width = 10, height = height, dpi = 300)
+  ggplot2::ggsave(paste0(stem, ".pdf"), p, width = 10, height = height)
+}
+
+# 6. RUN EVERY COMPARISON AND COLLECTION ---------------------------------------
+for (comparison in names(comparisons)) {
+  message("Running: ", comparison)
+  # TSV input; use read.csv() here for comma-separated files.
+  df <- utils::read.delim(comparisons[[comparison]], check.names = FALSE,
+                          stringsAsFactors = FALSE)
+  ranks <- prepare_ranks(df)
+  folder <- file.path(output_dir, comparison)
+  dir.create(folder, recursive = TRUE, showWarnings = FALSE)
+  utils::write.csv(data.frame(gene = names(ranks), score = unname(ranks)),
+                   file.path(folder, "ranked_genes.csv"), row.names = FALSE)
+  sheets <- list()
+  for (collection in names(gene_sets)) {
+    pathways <- gene_sets[[collection]]
+    overlap <- sum(names(ranks) %in% unique(unlist(pathways, use.names = FALSE)))
+    message(collection, ": ", overlap, " ranked genes match this collection.")
+    if (overlap < min_size) stop("Too little gene overlap: check species and identifier type.")
+    set.seed(seed)
+    result <- as.data.frame(fgsea::fgseaMultilevel(
+      pathways = pathways, stats = ranks, minSize = min_size,
+      maxSize = max_size, nproc = 1
+    ))
+    if (nrow(result)) result <- result[order(result$padj, result$pval), , drop = FALSE]
+    saveRDS(result, file.path(folder, paste0(collection, "_GSEA.rds")))
+    # Flatten list columns for portable CSV and Excel export.
+    flat <- result
+    if ("leadingEdge" %in% names(flat)) {
+      flat$leadingEdge <- vapply(flat$leadingEdge, paste, collapse = ";", FUN.VALUE = character(1))
+    }
+    sheets[[collection]] <- flat
+    utils::write.csv(flat, file.path(folder, paste0(collection, "_GSEA.csv")), row.names = FALSE)
+    if (nrow(result)) {
+      save_bubble(result, "Positive", collection, comparison, folder)
+      save_bubble(result, "Negative", collection, comparison, folder)
+    }
+  }
+  openxlsx::write.xlsx(sheets, file.path(folder, "GSEA_results.xlsx"), overwrite = TRUE)
+}
+
+# 7. SAVE SETTINGS AND SOFTWARE VERSIONS ---------------------------------------
+# sessionInfo() includes platform details; review before sharing run outputs.
+saveRDS(list(species = species, min_size = min_size, max_size = max_size,
+             fdr_cutoff = fdr_cutoff, top_n = top_n, seed = seed,
+             gene_col = gene_col, effect_col = effect_col,
+             pvalue_col = pvalue_col, stat_col = stat_col),
+        file.path(output_dir, "settings.rds"))
+writeLines(capture.output(utils::sessionInfo()), file.path(output_dir, "sessionInfo.txt"))
+message("Finished. Results saved to: ", output_dir)
+
+# INTERPRETATION:
+# NES > 0: enrichment toward positive-ranking genes.
+# NES < 0: enrichment toward negative-ranking genes.
+# These directions alone do not establish pathway activation or suppression.
+# padj is BH-adjusted within each collection and comparison, not across all runs.
+# Bubble size is the tested gene-set size after overlap with ranked genes;
+# it is not the number of leading-edge genes. All tested terms are exported.
